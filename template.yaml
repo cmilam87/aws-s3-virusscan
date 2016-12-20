@@ -5,10 +5,10 @@ Metadata:
   'AWS::CloudFormation::Interface':
     ParameterGroups:
     - Label:
-        default: 'Parent Stacks'
+        default: 'Environment Parameters'
       Parameters:
-      - ParentVPCStack
-      - ParentSSHBastionStack
+      - Environment
+      - UID
     - Label:
         default: 'Scan Parameters'
       Parameters:
@@ -23,19 +23,25 @@ Metadata:
         default: 'EC2 Parameters'
       Parameters:
       - KeyName
-      - IAMUserSSHAccess
       - InstanceType
       - LogsRetentionInDays
       - VolumeSize
-      - NewRelicLicenseKey
+
 Parameters:
-  ParentVPCStack:
-    Description: 'Stack name of parent VPC stack based on vpc/vpc-*azs.yaml template.'
+  Environment:
     Type: String
-  ParentSSHBastionStack:
-    Description: 'Optional stack name of parent SSH bastion host/instance stack based on vpc/vpc-ssh-bastion.yaml template.'
+    Description: 'The name of the environment'
+    AllowedValues:
+      - dev
+      - test
+      - preview
+      - prod
+
+  UID:
     Type: String
-    Default: ''
+    Description: Three lowercase characters to be used as a uid for resources in this stack, starting with 'u'.  Example 'uaa'
+    AllowedPattern: u[a-z]{2}
+
   DeleteInfectedFiles:
     Description: 'Automatically delete infected files'
     Type: String
@@ -43,6 +49,7 @@ Parameters:
     AllowedValues:
     - true
     - false
+
   ReportCleanFiles:
     Description: 'Report successful scan of clean, as well as infected files to the SNS topic'
     Type: String
@@ -50,37 +57,44 @@ Parameters:
     AllowedValues:
     - true
     - false
+
   AutoScalingMinSize:
     Description: 'Min Size for Auto Scaling'
     Type: Number
     Default: 1
     ConstraintDescription: 'Must be >= 1'
     MinValue: 1
+
   AutoScalingMaxSize:
     Description: 'Max Size for Auto Scaling'
     Type: Number
     Default: 1
     ConstraintDescription: 'Must be >= 1'
     MinValue: 1
+
   KeyName:
     Description: 'Optional provide an EC2 key pair if you want to login via SSH'
-    Type: String
-  IAMUserSSHAccess:
-    Description: 'Synchronize public keys of IAM users to enable personalized SSH access (Doc: https://cloudonaut.io/manage-aws-ec2-ssh-access-with-iam/).'
-    Type: String
-    Default: false
-    AllowedValues:
-    - true
-    - false
+    Type: AWS::EC2::KeyPair::KeyName
+
   InstanceType:
     Description: 'Specifies the instance type of the EC2 instance'
     Type: String
     Default: 't2.micro'
+    AllowedValues:
+    - t2.nano
+    - t2.micro
+    - t2.small
+    - t2.medium
+    - t2.large
+    - t2.xlarge
+    - t2.2xlarge
+
   LogsRetentionInDays:
     Description: 'Specifies the number of days you want to retain log events.'
     Type: Number
     Default: 14
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
   VolumeSize:
     Description: The size of the volume, in gibibytes (GiBs).
     Type: Number
@@ -88,18 +102,10 @@ Parameters:
     ConstraintDescription: 'Must be in the range [8-1024]'
     MinValue: 8
     MaxValue: 1024
-  NewRelicLicenseKey:
-    Description: 'Optional New Relic License Key will install the New Relic Servers for Linux agent.'
-    Type: String
-    Default: ''
-    NoEcho: true
+
 Conditions:
-  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
-  HasIAMUserSSHAccess: !Equals [!Ref IAMUserSSHAccess, 'true']
-  HasSSHBastionSecurityGroup: !Not [!Equals [!Ref ParentSSHBastionStack, '']]
-  HasNotSSHBastionSecurityGroup: !Equals [!Ref ParentSSHBastionStack, '']
-  HasNewRelic: !Not [!Equals [!Ref NewRelicLicenseKey, '']]
-Resources:
+  DeleteInfected: !Equals [!Ref DeleteInfectedFiles, 'true']
+
 Mappings:
   RegionMap:
     'ap-south-1':
@@ -126,10 +132,16 @@ Mappings:
       AMI: 'ami-de347abe'
     'us-west-2':
       AMI: 'ami-b04e92d0'
+
 Resources:
   FindingsTopic:
     Type: 'AWS::SNS::Topic'
-    Properties: {}
+    Properties:
+      TopicName: !Join ['-', [!Ref Environment, 'virusScanner', !Ref UID]]
+      Subscription:
+        - Endpoint: alerts@schoolpointe.com
+          Protocol: email
+
   ScanQueue:
     Type: 'AWS::SQS::Queue'
     Properties:
@@ -137,6 +149,7 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt 'ScanQueueDLQ.Arn'
         maxReceiveCount: 3
+
   ScanQueueFullAlarm:
     Type: 'AWS::CloudWatch::Alarm'
     Properties:
@@ -152,6 +165,7 @@ Resources:
       Period: 60
       Statistic: Sum
       Threshold: 100
+
   ScanQueueEmptyAlarm:
     Type: 'AWS::CloudWatch::Alarm'
     Properties:
@@ -167,6 +181,7 @@ Resources:
       Period: 60
       Statistic: Sum
       Threshold: 0
+
   ScanQueuePolicy:
     Type: 'AWS::SQS::QueuePolicy'
     Properties:
@@ -180,10 +195,12 @@ Resources:
           Resource: !GetAtt 'ScanQueue.Arn'
       Queues:
       - !Ref ScanQueue
+
   ScanQueueDLQ:
     Type: 'AWS::SQS::Queue'
     Properties:
       MessageRetentionPeriod: 1209600
+
   ScanQueueDLQAlarm:
     Type: 'AWS::CloudWatch::Alarm'
     Properties:
@@ -200,6 +217,7 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       AlarmActions:
       - !Ref FindingsTopic
+
   ScanAutoScalingGroup:
     Type: 'AWS::AutoScaling::AutoScalingGroup'
     Properties:
@@ -208,11 +226,11 @@ Resources:
       MaxSize: !Ref AutoScalingMaxSize
       MinSize: !Ref AutoScalingMinSize
       VPCZoneIdentifier:
-      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPublic'
-      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPublic'
+      - !ImportValue PrivateSubnet0
+      - !ImportValue PrivateSubnet1
       Tags:
       - Key: Name
-        Value: !Ref 'AWS::StackName'
+        Value: !Join ['-', [!Ref Environment, 'virusScanner', !Ref UID]]
         PropagateAtLaunch: true
     CreationPolicy:
       ResourceSignal:
@@ -221,6 +239,7 @@ Resources:
       AutoScalingRollingUpdate:
         PauseTime: PT10M
         WaitOnResourceSignals: true
+
   ScanScaleUp:
     Type: 'AWS::AutoScaling::ScalingPolicy'
     Properties:
@@ -228,6 +247,7 @@ Resources:
       AutoScalingGroupName: !Ref ScanAutoScalingGroup
       Cooldown: 300
       ScalingAdjustment: 1
+
   ScanScaleDown:
     Type: 'AWS::AutoScaling::ScalingPolicy'
     Properties:
@@ -235,11 +255,13 @@ Resources:
       AutoScalingGroupName: !Ref ScanAutoScalingGroup
       Cooldown: 300
       ScalingAdjustment: -1
+
   ScanInstanceProfile:
     Type: 'AWS::IAM::InstanceProfile'
     Properties:
       Roles:
       - !Ref ScanIAMRole
+
   ScanIAMRole:
     Type: 'AWS::IAM::Role'
     Properties:
@@ -259,7 +281,7 @@ Resources:
           - Effect: Allow
             Action:
             - 's3:GetObject*'
-            - 's3:DeleteObject*'
+            - !If [DeleteInfected, 's3:DeleteObject', !Ref 'AWS::NoValue']
             Resource: '*'
       - PolicyName: sqs
         PolicyDocument:
@@ -288,113 +310,16 @@ Resources:
             - 'logs:PutLogEvents'
             - 'logs:DescribeLogStreams'
             Resource: 'arn:aws:logs:*:*:*'
-  ScanIAMPolicySSHAccess:
-    Type: 'AWS::IAM::Policy'
-    Condition: HasIAMUserSSHAccess
-    Properties:
-      Roles:
-      - !Ref ScanIAMRole
-      PolicyName: iam
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-        - Effect: Allow
-          Action:
-          - 'iam:ListUsers'
-          Resource:
-          - '*'
-        - Effect: Allow
-          Action:
-          - 'iam:ListSSHPublicKeys'
-          - 'iam:GetSSHPublicKey'
-          Resource:
-          - !Sub 'arn:aws:iam::${AWS::AccountId}:user/*'
+
   Logs:
     Type: 'AWS::Logs::LogGroup'
     Properties:
       RetentionInDays: !Ref LogsRetentionInDays
+
   ScanLaunchConfiguration:
     Type: 'AWS::AutoScaling::LaunchConfiguration'
     Metadata:
       'AWS::CloudFormation::Init':
-        configSets:
-          default:
-            !If
-            - HasNewRelic
-            - !If [HasIAMUserSSHAccess, [ssh-access, newrelic, config], [newrelic, config]]
-            - !If [HasIAMUserSSHAccess, [ssh-access, config], [config]]
-        newrelic:
-          packages:
-            rpm:
-              newrelic-sysmond: 'https://download.newrelic.com/pub/newrelic/el5/x86_64/newrelic-sysmond-2.3.0.132-1.x86_64.rpm'
-          files:
-            '/etc/newrelic/nrsysmond.cfg':
-              content: !Sub |
-                license_key=${NewRelicLicenseKey}
-                loglevel=info
-                logfile=/var/log/newrelic/nrsysmond.log
-                labels=StackName:${AWS::StackName};AccountId:${AWS::AccountId};Region:${AWS::Region}
-              mode: '000640'
-              owner: root
-              group: newrelic
-          services:
-            sysvinit:
-              newrelic-sysmond:
-                enabled: true
-                ensureRunning: true
-                files:
-                - '/etc/newrelic/nrsysmond.cfg'
-        ssh-access:
-          files:
-            '/opt/authorized_keys_command.sh':
-              content: !Sub |
-                #!/bin/bash -e
-                if [ -z "$1" ]; then
-                  exit 1
-                fi
-                aws iam list-ssh-public-keys --user-name "$1" --query "SSHPublicKeys[?Status == 'Active'].[SSHPublicKeyId]" --output text | while read KeyId;
-                do
-                  aws iam get-ssh-public-key --user-name "$1" --ssh-public-key-id "$KeyId" --encoding SSH --query "SSHPublicKey.SSHPublicKeyBody" --output text
-                done
-              mode: '000755'
-              owner: root
-              group: root
-            '/opt/import_users.sh':
-              content: !Sub |
-                #!/bin/bash
-                aws iam list-users --query "Users[].[UserName]" --output text | while read User; do
-                  if id -u "$User" >/dev/null 2>&1; then
-                    echo "$User exists"
-                  else
-                    /usr/sbin/adduser "$User"
-                    echo "$User ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$User"
-                  fi
-                done
-              mode: '000755'
-              owner: root
-              group: root
-            '/etc/cron.d/import_users':
-              content: |
-                */10 * * * * root /opt/import_users.sh
-              mode: '000644'
-              owner: root
-              group: root
-          commands:
-            'a_configure_sshd_command':
-              command: 'sed -i "s:#AuthorizedKeysCommand none:AuthorizedKeysCommand /opt/authorized_keys_command.sh:g" /etc/ssh/sshd_config'
-            'b_configure_sshd_commanduser':
-              command: 'sed -i "s:#AuthorizedKeysCommandUser nobody:AuthorizedKeysCommandUser nobody:g" /etc/ssh/sshd_config'
-            'c_import_users':
-              command: './import_users.sh'
-              cwd: '/opt'
-          services:
-            sysvinit:
-              sshd:
-                enabled: true
-                ensureRunning: true
-                commands:
-                - 'a_configure_sshd_command'
-                - 'b_configure_sshd_commanduser'
         config:
           packages:
             yum:
@@ -402,8 +327,8 @@ Resources:
               clamav-update: []
               awslogs: []
             rubygems:
-              aws-sdk: ['2.2.29']
-              daemons: ['1.2.3']
+              aws-sdk: ['2.6.39']
+              daemons: ['1.2.4']
               rubysl-securerandom: ['2.0.0']
           files:
             '/opt/aws-s3-virusscan/daemon.rb':
@@ -681,8 +606,7 @@ Resources:
                 - '/etc/cfn/cfn-hup.conf'
                 - '/etc/cfn/hooks.d/cfn-auto-reloader.conf'
     Properties:
-      KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
-      AssociatePublicIpAddress: true
+      KeyName: !Ref KeyName
       EbsOptimized: false
       BlockDeviceMappings:
       - DeviceName: '/dev/xvda'
@@ -693,60 +617,30 @@ Resources:
       ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
       InstanceType: !Ref InstanceType
       SecurityGroups:
-      - !Ref ScanSecurityGroup
+      - !ImportValue DefaultSecurityGroup
       UserData:
         'Fn::Base64': !Sub |
           #!/bin/bash -x
           /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ScanLaunchConfiguration --region ${AWS::Region}
           /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ScanAutoScalingGroup --region ${AWS::Region}
-  ScanSecurityGroup:
-    Type: 'AWS::EC2::SecurityGroup'
-    Properties:
-      GroupDescription: 'S3 VirusScan'
-      VpcId:
-        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
-  ScanSecurityGroupInSSHBastion:
-    Type: 'AWS::EC2::SecurityGroupIngress'
-    Condition: HasSSHBastionSecurityGroup
-    Properties:
-      GroupId: !Ref ScanSecurityGroup
-      IpProtocol: tcp
-      FromPort: 22
-      ToPort: 22
-      SourceSecurityGroupId:
-        'Fn::ImportValue': !Sub '${ParentSSHBastionStack}-SecurityGroup'
-  ScanSecurityGroupInAll:
-    Type: 'AWS::EC2::SecurityGroupIngress'
-    Condition: HasNotSSHBastionSecurityGroup
-    Properties:
-      GroupId: !Ref ScanSecurityGroup
-      IpProtocol: tcp
-      FromPort: 22
-      ToPort: 22
-      CidrIp: '0.0.0.0/0'
+
 Outputs:
   ScanQueueArn:
     Description: 'The ARN of the Scan Queue.'
     Value: !GetAtt 'ScanQueue.Arn'
-    Export:
-      Name: !Sub '${AWS::StackName}-ScanQueueArn'
+
   ScanQueueName:
     Description: 'The name of the Scan Queue.'
     Value: !GetAtt 'ScanQueue.QueueName'
-    Export:
-      Name: !Sub '${AWS::StackName}-ScanQueueName'
+
   ScanQueueUrl:
     Description: 'The URL of the Scan Queue.'
     Value: !Ref ScanQueue
-    Export:
-      Name: !Sub '${AWS::StackName}-ScanQueueUrl'
+
   FindingsTopicArn:
     Description: 'The ARN of the Findings Topic.'
     Value: !Ref FindingsTopic
-    Export:
-      Name: !Sub '${AWS::StackName}-FindingsTopicArn'
+
   FindingsTopicName:
     Description: 'The name of the Findings Topic.'
     Value: !GetAtt 'FindingsTopic.TopicName'
-    Export:
-      Name: !Sub '${AWS::StackName}-FindingsTopicName'
